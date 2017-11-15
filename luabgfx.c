@@ -641,9 +641,8 @@ lsetViewClearMRT(lua_State *L) {
 static int
 ltouch(lua_State *L) {
 	int id = luaL_checkinteger(L, 1);
-	int drawcall = bgfx_touch(id);
-	lua_pushinteger(L, drawcall);
-	return 1;
+	bgfx_touch(id);
+	return 0;
 }
 
 static int
@@ -805,9 +804,8 @@ lsubmit(lua_State *L) {
 	int depth = luaL_optinteger(L, 3, 0);
 	int preserveState = lua_toboolean(L, 4);
 	bgfx_program_handle_t ph = { progid };
-	int drawcall = bgfx_submit(id, ph, depth, preserveState);
-	lua_pushinteger(L, drawcall);
-	return 1;
+	bgfx_submit(id, ph, depth, preserveState);
+	return 0;
 }
 
 #define CASE(v) (strcmp(what,#v) == 0)
@@ -2332,7 +2330,7 @@ lsetUniform(lua_State *L) {
 		default:
 			return luaL_error(L, "Invalid uniform type %d", info.type);
 		}
-		uint8_t buffer[sz * n];
+		ARRAY(uint8_t, buffer, sz * n);
 		if (info.type == BGFX_UNIFORM_TYPE_INT1) {
 			int i;
 			int32_t * data = (int32_t *)buffer;
@@ -2635,7 +2633,7 @@ create_fb_mrt(lua_State *L) {
 		luaL_error(L, "At lease one frame buffer");
 	}
 	int destroy = lua_toboolean(L, 2);
-	bgfx_texture_handle_t handles[n];
+	ARRAY(bgfx_texture_handle_t, handles, n);
 	int i;
 	for (i=0;i<n;i++) {
 		if (lua_geti(L, 1, i+1) != LUA_TNUMBER) {
@@ -2793,7 +2791,7 @@ lsetViewOrder(lua_State *L) {
 	luaL_checktype(L, 1, LUA_TTABLE);
 	// todo: set first view not 0
 	int n = lua_rawlen(L, 1);
-	uint8_t order[n];
+	ARRAY(uint8_t, order, n);
 	int i;
 	for (i=0;i<n;i++) {
 		if (lua_geti(L, 1, i+1) != LUA_TNUMBER) {
@@ -3116,8 +3114,7 @@ lsubmitOcclusionQuery(lua_State *L) {
 	int preserveState = lua_toboolean(L, 5);
 	bgfx_program_handle_t ph = { progid };
 	bgfx_occlusion_query_handle_t oqh = { oqid };
-	int drawcall = bgfx_submit_occlusion_query(id, ph, oqh, depth, preserveState);
-	lua_pushinteger(L, drawcall);
+	bgfx_submit_occlusion_query(id, ph, oqh, depth, preserveState);
 	return 1;
 }
 
@@ -3133,9 +3130,8 @@ lsubmitIndirect(lua_State *L) {
 	bgfx_program_handle_t ph = { progid };
 	bgfx_indirect_buffer_handle_t ih = { iid };
 
-	int drawcall = bgfx_submit_indirect(id, ph, ih, start, num, depth, preserveState);
-	lua_pushinteger(L, drawcall);
-	return 1;
+	bgfx_submit_indirect(id, ph, ih, start, num, depth, preserveState);
+	return 0;
 }
 
 static int
@@ -3311,8 +3307,7 @@ ldispatch(lua_State *L) {
 
 	bgfx_program_handle_t  handle = { pid };
 
-	uint32_t dc = bgfx_dispatch(viewid, handle, num[0], num[1], num[2], flags); 
-	lua_pushinteger(L, dc);
+	bgfx_dispatch(viewid, handle, num[0], num[1], num[2], flags); 
 
 	return 1;
 }
@@ -3327,8 +3322,7 @@ ldispatchIndirect(lua_State *L) {
 	bgfx_program_handle_t  phandle = { pid };
 	bgfx_indirect_buffer_handle_t  ihandle = { iid };
 
-	uint32_t dc = bgfx_dispatch_indirect(viewid, phandle, ihandle, num[0], num[1], flags); 
-	lua_pushinteger(L, dc);
+	bgfx_dispatch_indirect(viewid, phandle, ihandle, num[0], num[1], flags); 
 
 	return 1;
 }
@@ -3339,7 +3333,7 @@ lgetShaderUniforms(lua_State *L) {
 	bgfx_shader_handle_t shader = { sid };
 	uint16_t n = bgfx_get_shader_uniforms(shader, NULL, 0);
 	lua_createtable(L, n, 0);
-	bgfx_uniform_handle_t u[n];
+	ARRAY(bgfx_uniform_handle_t, u, n);
 	bgfx_get_shader_uniforms(shader, u, n);
 	int i;
 	for (i=0;i<n;i++) {
