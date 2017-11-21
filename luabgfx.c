@@ -3115,7 +3115,7 @@ lsubmitOcclusionQuery(lua_State *L) {
 	bgfx_program_handle_t ph = { progid };
 	bgfx_occlusion_query_handle_t oqh = { oqid };
 	bgfx_submit_occlusion_query(id, ph, oqh, depth, preserveState);
-	return 1;
+	return 0;
 }
 
 static int
@@ -3309,7 +3309,7 @@ ldispatch(lua_State *L) {
 
 	bgfx_dispatch(viewid, handle, num[0], num[1], num[2], flags); 
 
-	return 1;
+	return 0;
 }
 
 static int
@@ -3324,7 +3324,7 @@ ldispatchIndirect(lua_State *L) {
 
 	bgfx_dispatch_indirect(viewid, phandle, ihandle, num[0], num[1], flags); 
 
-	return 1;
+	return 0;
 }
 
 static int
