@@ -124,7 +124,7 @@ local function setOffsets2x2Lum(handle, width, height)
 		end
 	end
 
-	bgfx.set_uniform(handle, offsets, num)
+	bgfx.set_uniform(handle, table.unpack(offsets))
 end
 
 local function setOffsets4x4Lum(handle, width, height)
@@ -139,7 +139,7 @@ local function setOffsets4x4Lum(handle, width, height)
 		end
 	end
 
-	bgfx.set_uniform(handle, offsets, num)
+	bgfx.set_uniform(handle, table.unpack(offsets))
 end
 
 local time = 0
@@ -287,7 +287,8 @@ local function mainloop()
 
 	if ctx.m_rb then
 		bgfx.blit(hdrHBlurTonemap, ctx.m_rb, 0, 0, bgfx.get_texture(ctx.m_lum[5]) )
-		settings.lumAvg = bgfx.read_texture(ctx.m_rb, 4)
+		bgfx.read_texture(ctx.m_rb, ctx.lumAvg_data)
+		settings.lumAvg = tostring(ctx.lumAvg_data)
 		update_lumarg()
 	end
 
@@ -304,16 +305,12 @@ local function init(canvas)
 	}
 	ctx.tvb = bgfx.transient_buffer "fffdff"
 	ctx.state = bgfx.make_state {
-		RGB_WRITE = true,
-		ALPHA_WRITE = true,
-		DEPTH_WRITE = false,
+		WRITE_MASK = "RGBA",
 		MSAA = false,
 	}
 	ctx.mesh_state = bgfx.make_state {
-		RGB_WRITE = true,
-		ALPHA_WRITE = true,
+		WRITE_MASK = "RGBAZ",
 		DEPTH_TEST = "LESS",
-		DEPTH_WRITE = true,
 		CULL = "CCW",
 		MSAA = true,
 	}
@@ -357,6 +354,8 @@ local function init(canvas)
 
 	ctx.ortho = math3d.matrix("ortho"):orthomat(0,1,1,0,0,100,0)
 	ctx.m_fbtextures = {}
+
+	ctx.lumAvg_data = bgfx.memory_texture(4)
 
 	ant.mainloop(mainloop)
 end

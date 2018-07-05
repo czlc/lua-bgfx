@@ -10,7 +10,51 @@
 #include <lauxlib.h>
 #include <bgfx/c99/bgfx.h>
 #include <bgfx/c99/platform.h>
+#include <assert.h>
+
 #include "luabgfx.h"
+#include "simplelock.h"
+
+#if _MSC_VER > 0
+#include <malloc.h>
+
+#	ifdef USING_ALLOCA_FOR_VLA
+#		define VLA(_TYPE, _VAR, _SIZE)	_TYPE _VAR = (_TYPE*)_alloca(sizeof(_TYPE) * (_SIZE))
+#	else//!USING_ALLOCA_FOR_VLA
+#		define V(_SIZE)	4096
+#	endif //USING_ALLOCA_FOR_VLA
+#else //!(_MSC_VER > 0)
+#	ifdef USING_ALLOCA_FOR_VLA
+#		define VLA(_TYPE, _VAR, _SIZE) _TYPE _VAR[(_SIZE)]
+#	else //!USING_ALLOCA_FOR_VLA
+#		define V(_SIZE)	(_SIZE)
+#	endif //USING_ALLOCA_FOR_VLA
+
+#endif //_MSC_VER > 0
+
+// screenshot queue length
+#define MAX_SCREENSHOT 16
+
+struct screenshot {
+	uint32_t width;
+	uint32_t height;
+	uint32_t pitch;
+	uint32_t size;
+	void *data;
+	char *name;
+};
+
+struct screenshot_queue {
+	spinlock_t lock;
+	unsigned int head;
+	unsigned int tail;
+	struct screenshot *q[MAX_SCREENSHOT];
+};
+
+struct callback {
+	bgfx_callback_interface_t base;
+	struct screenshot_queue ss;
+};
 
 static void *
 getfield(lua_State *L, const char *key) {
@@ -58,11 +102,6 @@ renderer_type_id(lua_State *L, int index) {
 	return id;
 }
 
-struct callback {
-	bgfx_callback_interface_t base;
-	lua_State *L;
-};
-
 static void
 cb_fatal(bgfx_callback_interface_t *self, bgfx_fatal_t code, const char *str) {
 	fprintf(stderr, "Fatal error: 0x%08x: %s", code, str);
@@ -106,8 +145,70 @@ static void
 cb_cache_write(bgfx_callback_interface_t *self, uint64_t id, const void *data, uint32_t size) {
 }
 
+static struct screenshot *
+ss_pop(struct screenshot_queue *queue) {
+	struct screenshot *r;
+	spin_lock(queue);
+	if (queue->head == queue->tail) {
+		r = NULL;
+	} else {
+		r = queue->q[queue->tail % MAX_SCREENSHOT];
+		++queue->tail;
+	}
+	spin_unlock(queue);
+	return r;
+}
+
+// succ return NULL
+static struct screenshot *
+ss_push(struct screenshot_queue *queue, struct screenshot *s) {
+	spin_lock(queue);
+	if ((queue->head - queue->tail) != MAX_SCREENSHOT) {
+		queue->q[queue->head % MAX_SCREENSHOT] = s;
+		++queue->head;
+		s = NULL;
+	}
+	spin_unlock(queue);
+	return s;
+}
+
+static void
+ss_free(struct screenshot * s) {
+	if (s == NULL)
+		return;
+	free(s->name);
+	free(s->data);
+	free(s);
+}
+
 static void
 cb_screen_shot(bgfx_callback_interface_t *self, const char* file, uint32_t width, uint32_t height, uint32_t pitch, const void* data, uint32_t size, bool yflip) {
+	struct screenshot *s = malloc(sizeof(*s));
+	size_t fn_sz = strlen(file);
+	s->name = malloc(fn_sz + 1);
+	memcpy(s->name, file, fn_sz+1);
+	s->data = malloc(size);
+	s->width = width;
+	s->height = height;
+	s->pitch = pitch;
+	s->size = size;
+	uint8_t * dst = (uint8_t *)s->data;
+	const uint8_t * src = (const uint8_t *)data;
+	int line_pitch = pitch;
+	if (yflip) {
+		src += (height-1) * pitch;
+		line_pitch = - (int32_t)pitch;
+	}
+	uint32_t pixwidth = size / height;
+	uint32_t i;
+	for (i=0;i<height;i++) {
+		memcpy(dst, src, pixwidth);
+		dst += pixwidth;
+		src += line_pitch;
+	}
+	struct callback *cb = (struct callback *)self;
+	s = ss_push(&cb->ss, s);
+	ss_free(s);
 }
 
 static void
@@ -120,6 +221,62 @@ cb_capture_end(bgfx_callback_interface_t *self) {
 
 static void
 cb_capture_frame(bgfx_callback_interface_t* self, const void* _data, uint32_t _size) {
+}
+
+static uint32_t
+reset_flags(lua_State *L, int index) {
+	const char * flags = lua_tostring(L, index);
+	uint32_t f = BGFX_RESET_NONE;
+	if (flags) {
+		int i;
+		for (i=0;flags[i];i++) {
+			switch(flags[i]) {
+			case 'f' : f |= BGFX_RESET_FULLSCREEN; break;
+			case 'v' : f |= BGFX_RESET_VSYNC; break;
+			case 'a' : f |= BGFX_RESET_MAXANISOTROPY; break;
+			case 'c' : f |= BGFX_RESET_CAPTURE; break;
+			case 'h' : f |= BGFX_RESET_HMD; break;
+			case 'd' : f |= BGFX_RESET_HMD_DEBUG; break;
+			case 'r' : f |= BGFX_RESET_HMD_RECENTER; break;
+			case 'u' : f |= BGFX_RESET_FLUSH_AFTER_RENDER; break;
+			case 'i' : f |= BGFX_RESET_FLIP_AFTER_RENDER; break;
+			case 's' : f |= BGFX_RESET_SRGB_BACKBUFFER; break;
+			case 'm' :
+				++i;
+				switch (flags[i]) {
+				case '2' : f |= BGFX_RESET_MSAA_X2; break;
+				case '4' : f |= BGFX_RESET_MSAA_X4; break;
+				case '8' : f |= BGFX_RESET_MSAA_X8; break;
+				case 'x' : f |= BGFX_RESET_MSAA_X16; break;
+				default:
+					return luaL_error(L, "Invalid MSAA %c", flags[i]);
+				}
+				break;
+			default:
+				return luaL_error(L, "Invalid reset flag %c", flags[i]);
+			}
+		}
+	}
+	return f;
+}
+
+static void
+read_uint32(lua_State *L, int index, const char * key, uint32_t *v) {
+	if (lua_getfield(L, index, key) != LUA_TNIL) {
+		*v = luaL_checkinteger(L, -1);
+	}
+	lua_pop(L, 1);
+}
+
+static void
+read_boolean(lua_State *L, int index, const char *key, bool *v) {
+	int t = lua_getfield(L, index, key);
+	if (t == LUA_TBOOLEAN || t == LUA_TNIL) {
+		*v = lua_toboolean(L, -1);
+	} else {
+		luaL_error(L, ".%s need boolean, it's %s", key, lua_typename(L, t));
+	}
+	lua_pop(L, 1);
 }
 
 static int
@@ -139,21 +296,53 @@ linit(lua_State *L) {
 		cb_capture_frame,
 	};
 	struct callback *cb = lua_newuserdata(L, sizeof(*cb));
+	memset(cb, 0, sizeof(*cb));
 	lua_setfield(L, LUA_REGISTRYINDEX, "bgfx_cb");
 	cb->base.vtbl = &vtbl;
-	cb->L = luaL_newstate();
 
-	bgfx_renderer_type_t id = BGFX_RENDERER_TYPE_COUNT;
+	bgfx_init_t init;
+
+	init.type = BGFX_RENDERER_TYPE_COUNT;
+	init.vendorId = BGFX_PCI_ID_NONE;
+	init.deviceId = 0;
+
+	init.resolution.width = 1280;
+	init.resolution.height = 720;
+	init.resolution.reset = BGFX_RESET_NONE;	// reset flags
+
+	init.limits.maxEncoders     = 8;	// BGFX_CONFIG_DEFAULT_MAX_ENCODERS;
+	init.limits.transientVbSize = (6<<20);	// BGFX_CONFIG_TRANSIENT_VERTEX_BUFFER_SIZE
+	init.limits.transientIbSize = (2<<20);	// BGFX_CONFIG_TRANSIENT_INDEX_BUFFER_SIZE;
+
+	init.callback = &cb->base;
+	init.allocator = NULL;
+	init.debug = false;
+	init.profile = false;
+
 	if (!lua_isnoneornil(L, 1)) {
-		id = renderer_type_id(L, 1);
+		luaL_checktype(L, 1, LUA_TTABLE);
+		lua_settop(L, 1);
+		if (lua_getfield(L, 1, "renderer") == LUA_TSTRING) {
+			init.type = renderer_type_id(L, 2);
+		}
+		lua_pop(L, 1);
+		read_uint32(L, 1, "width", &init.resolution.width);
+		read_uint32(L, 1, "height", &init.resolution.height);
+		if (lua_getfield(L, 1, "reset") == LUA_TSTRING) {
+			init.resolution.reset = reset_flags(L, -1);
+		}
+		lua_pop(L, 1);
+		if (lua_getfield(L, 1, "maxEncoders") == LUA_TNUMBER) {
+			init.limits.maxEncoders = luaL_checkinteger(L, -1);
+		}
+		lua_pop(L, 1);
+		read_uint32(L, 1, "transientVbSize", &init.limits.transientVbSize);
+		read_uint32(L, 1, "transientIbSize", &init.limits.transientIbSize);
+		read_boolean(L, 1, "debug", &init.debug);
+		read_boolean(L, 1, "profile", &init.profile);
 	}
-	if (!bgfx_init(id
-			, BGFX_PCI_ID_NONE
-			, 0
-			, &cb->base
-			, NULL
-			)) {
-		lua_close(cb->L);
+
+	if (!bgfx_init(&init)) {
 		return luaL_error(L, "bgfx init failed");
 	}
 	return 0;
@@ -209,6 +398,7 @@ push_supported(lua_State *L, uint64_t supported) {
 		CAPSNAME(TEXTURE_COMPARE_ALL)   // All texture compare modes are supported.
 		CAPSNAME(TEXTURE_COMPARE_LEQUAL)// Texture compare less equal mode is supported.
 		CAPSNAME(TEXTURE_CUBE_ARRAY)    // Cubemap texture array is supported.
+		CAPSNAME(TEXTURE_DIRECT_ACCESS) // CPU direct access to GPU texture memory.
 		CAPSNAME(TEXTURE_READ_BACK)     // Read-back texture is supported.
 		CAPSNAME(VERTEX_ATTRIB_HALF)    // Vertex attribute half-float is supported.
 		CAPSNAME(VERTEX_ATTRIB_UINT10)  // Vertex attribute 10_10_10_2 is supported.
@@ -268,6 +458,17 @@ static const char * c_texture_formats[] = {
 	TFNAME(PTC14A)
 	TFNAME(PTC22)
 	TFNAME(PTC24)
+
+	TFNAME(ATC)
+	TFNAME(ATCE)
+	TFNAME(ATCI)
+	TFNAME(ASTC4x4)
+	TFNAME(ASTC5x5)
+	TFNAME(ASTC6x6)
+	TFNAME(ASTC8x5)
+	TFNAME(ASTC8x6)
+	TFNAME(ASTC10x5)
+
 	TFNAME(UNKNOWN)
 	TFNAME(R1)
 	TFNAME(A8)
@@ -327,6 +528,8 @@ static const char * c_texture_formats[] = {
 	TFNAME(D24F)
 	TFNAME(D32F)
 	TFNAME(D0S8)
+
+
 };
 
 static void
@@ -375,12 +578,13 @@ push_texture_formats(lua_State *L, const uint16_t *formats) {
 
 static void
 push_limits(lua_State *L, const bgfx_caps_limits_t *lim) {
-	lua_createtable(L, 0, 18);
+	lua_createtable(L, 0, 22);
 #define PUSH_LIMIT(what) lua_pushinteger(L, lim->what); lua_setfield(L, -2, #what);
 
 	PUSH_LIMIT(maxDrawCalls)
 	PUSH_LIMIT(maxBlits)
 	PUSH_LIMIT(maxTextureSize)
+	PUSH_LIMIT(maxTextureLayers)
 	PUSH_LIMIT(maxViews)
 	PUSH_LIMIT(maxFrameBuffers)
 	PUSH_LIMIT(maxFBAttachments)
@@ -396,6 +600,9 @@ push_limits(lua_State *L, const bgfx_caps_limits_t *lim) {
 	PUSH_LIMIT(maxDynamicVertexBuffers)
 	PUSH_LIMIT(maxUniforms)
 	PUSH_LIMIT(maxOcclusionQueries)
+	PUSH_LIMIT(maxEncoders)
+	PUSH_LIMIT(transientVbSize)
+	PUSH_LIMIT(transientIbSize)
 }
 
 static int
@@ -443,29 +650,55 @@ lgetStats(lua_State *L) {
 	}
 	const bgfx_stats_t * stat = bgfx_get_stats();
 	int i;
-#define PUSHSTAT(v) lua_pushinteger(L, stat->v); lua_setfield(L, 2, #v); break
+#define PUSHSTAT(v) lua_pushinteger(L, stat->v); lua_setfield(L, 2, #v)
 	for (i=0;what[i];++i) {
 	switch(what[i]) {
-	case 'w': PUSHSTAT(width);
-	case 'h': PUSHSTAT(height);
-	case 'W': PUSHSTAT(textWidth);
-	case 'H': PUSHSTAT(textHeight);
-	case 'd': PUSHSTAT(numDraw);
-	case 'c': PUSHSTAT(numCompute);
-	case 'l': PUSHSTAT(maxGpuLatency);
-	case 's': PUSHSTAT(waitSubmit);
-	case 'r': PUSHSTAT(waitRender);
-	case 'C':  {
+	case 's':	// back buffer size
+		PUSHSTAT(width);
+		PUSHSTAT(height);
+		break;
+	case 'd': // debug size
+		PUSHSTAT(textWidth);
+		PUSHSTAT(textHeight);
+		break;
+	case 'c':	// draw calls
+		PUSHSTAT(numDraw);
+		PUSHSTAT(numCompute);
+		PUSHSTAT(maxGpuLatency);
+#define PUSHPRIM(v,name) if (stat->numPrims[v] > 0) { lua_pushinteger(L, stat->numPrims[v]); lua_setfield(L, 2, name); }
+		PUSHPRIM(BGFX_TOPOLOGY_TRI_LIST, "numTriList");
+		PUSHPRIM(BGFX_TOPOLOGY_TRI_STRIP, "numTriStrip");
+		PUSHPRIM(BGFX_TOPOLOGY_LINE_LIST, "numLineList");
+		PUSHPRIM(BGFX_TOPOLOGY_LINE_STRIP, "numLineStrip");
+		PUSHPRIM(BGFX_TOPOLOGY_POINT_LIST, "numPointList");
+		break;
+	case 'n':	// numbers
+		PUSHSTAT(numDynamicIndexBuffers);
+		PUSHSTAT(numDynamicVertexBuffers);
+		PUSHSTAT(numFrameBuffers);
+		PUSHSTAT(numIndexBuffers);
+		PUSHSTAT(numOcclusionQueries);
+		PUSHSTAT(numPrograms);
+		PUSHSTAT(numShaders);
+		PUSHSTAT(numTextures);
+		PUSHSTAT(numUniforms);
+		PUSHSTAT(numVertexBuffers);
+		PUSHSTAT(numVertexDecls);
+	case 'm': // memories
+		PUSHSTAT(textureMemoryUsed);
+		PUSHSTAT(rtMemoryUsed);
+		PUSHSTAT(transientVbUsed);
+		PUSHSTAT(transientIbUsed);
+		break;
+	case 't':	// timers
+		PUSHSTAT(waitSubmit); break;
+		PUSHSTAT(waitRender); break;
 		lua_pushnumber(L, (stat->cpuTimeEnd - stat->cpuTimeBegin)*1000.0/stat->cpuTimerFreq);
 		lua_setfield(L, 2, "cpu");
-		break;
-	}
-	case 'G': {
 		lua_pushnumber(L, (stat->gpuTimeEnd - stat->gpuTimeBegin)*1000.0/stat->gpuTimerFreq);
 		lua_setfield(L, 2, "gpu");
 		break;
-	}
-	case 'v': {
+	case 'v': {	// views
 		if (lua_getfield(L, 2, "view") != LUA_TTABLE) {
 			lua_pop(L, 1);
 			lua_createtable(L, stat->numViews, 0);
@@ -521,38 +754,7 @@ static int
 lreset(lua_State *L) {
 	int width = luaL_checkinteger(L, 1);
 	int height = luaL_checkinteger(L, 2);
-	const char * flags = lua_tostring(L, 3);
-	uint32_t f = BGFX_RESET_NONE;
-	if (flags) {
-		int i;
-		for (i=0;flags[i];i++) {
-			switch(flags[i]) {
-			case 'f' : f |= BGFX_RESET_FULLSCREEN; break;
-			case 'v' : f |= BGFX_RESET_VSYNC; break;
-			case 'a' : f |= BGFX_RESET_MAXANISOTROPY; break;
-			case 'c' : f |= BGFX_RESET_CAPTURE; break;
-			case 'h' : f |= BGFX_RESET_HMD; break;
-			case 'd' : f |= BGFX_RESET_HMD_DEBUG; break;
-			case 'r' : f |= BGFX_RESET_HMD_RECENTER; break;
-			case 'u' : f |= BGFX_RESET_FLUSH_AFTER_RENDER; break;
-			case 'i' : f |= BGFX_RESET_FLIP_AFTER_RENDER; break;
-			case 's' : f |= BGFX_RESET_SRGB_BACKBUFFER; break;
-			case 'm' :
-				++i;
-				switch (flags[i]) {
-				case '2' : f |= BGFX_RESET_MSAA_X2; break;
-				case '4' : f |= BGFX_RESET_MSAA_X4; break;
-				case '8' : f |= BGFX_RESET_MSAA_X8; break;
-				case 'x' : f |= BGFX_RESET_MSAA_X16; break;
-				default:
-					return luaL_error(L, "Invalid MSAA %c", flags[i]);
-				}
-				break;
-			default:
-				return luaL_error(L, "Invalid reset flag %c", flags[i]);
-			}
-		}
-	}
+	uint32_t f = reset_flags(L, 3);
 	bgfx_reset(width, height, f); 
 	return 0;
 }
@@ -561,11 +763,11 @@ static int
 lshutdown(lua_State *L) {
 	bgfx_shutdown();
 	if (lua_getfield(L, LUA_REGISTRYINDEX, "bgfx_cb") == LUA_TUSERDATA) {
-		struct callback *cb = lua_touserdata(L, -1);
-		if (cb->L) {
-			lua_close(cb->L);
-			cb->L = NULL;
-		}
+//		struct callback *cb = lua_touserdata(L, -1);
+//		if (cb->L) {
+//			lua_close(cb->L);
+//			cb->L = NULL;
+//		}
 	}
 
 	return 0;
@@ -609,19 +811,19 @@ clear_flags(lua_State *L, const char *flags) {
 
 static int
 lsetViewClear(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	const char * flags = luaL_checkstring(L, 2);
 	uint32_t rgba = luaL_optinteger(L, 3, 0x000000ff);
 	float depth = luaL_optnumber(L, 4, 1.0f);
 	int stencil = luaL_optinteger(L, 5, 0);
 	int flag = clear_flags(L, flags);
-	bgfx_set_view_clear(id, flag, rgba, depth, stencil);
+	bgfx_set_view_clear(viewid, flag, rgba, depth, stencil);
 	return 0;
 }
 
 static int
 lsetViewClearMRT(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	const char * flags = luaL_checkstring(L, 2);
 	int flag = clear_flags(L, flags);
 	float depth = luaL_checknumber(L, 3);
@@ -631,26 +833,26 @@ lsetViewClearMRT(lua_State *L) {
 	int n = lua_gettop(L) - 4;
 	int i;
 	for (i=0;i<n;i++) {
-		c[i] = (uint8_t)luaL_checkinteger(L, 5+i);
+		c[i] = (uint8_t)luaL_optinteger(L, 5+i, UINT8_MAX);
 	}
-	bgfx_set_view_clear_mrt(id, flag, depth, stencil,
+	bgfx_set_view_clear_mrt(viewid, flag, depth, stencil,
 		c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7]);
 	return 0;
 }
 
 static int
 ltouch(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
-	bgfx_touch(id);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
+	bgfx_touch(viewid);
 	return 0;
 }
 
 static int
 lframe(lua_State *L) {
 	int capture = lua_toboolean(L, 1);
-	bgfx_frame(capture);
-	// todo : use result the frame number
-	return 0;
+	int frame = bgfx_frame(capture);
+	lua_pushinteger(L, frame);
+	return 1;
 }
 
 static int
@@ -799,7 +1001,7 @@ lcreateProgram(lua_State *L) {
 
 static int
 lsubmit(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t id = luaL_checkinteger(L, 1);
 	int progid = BGFX_LUAHANDLE_ID(PROGRAM, luaL_checkinteger(L, 2));
 	int depth = luaL_optinteger(L, 3, 0);
 	int preserveState = lua_toboolean(L, 4);
@@ -900,6 +1102,14 @@ combine_state(lua_State *L, uint64_t *state) {
 			luaL_error(L, "Invalid BLEND FUNC : %s", func);
 		}
 	}
+	else if CASE(BLEND_FUNC_RT) {
+		size_t sz;
+		const char *func = luaL_checklstring(L, -1, &sz);
+		if (sz != 3) {
+			luaL_error(L, "Invalid BLEND FUNC RT : %s", func);
+		}
+		return 1;
+	}
 	else if CASE(BLEND_EQUATION) {
 		*state &= ~BGFX_STATE_BLEND_EQUATION_MASK;
 		size_t sz;
@@ -915,6 +1125,22 @@ combine_state(lua_State *L, uint64_t *state) {
 			luaL_error(L, "Invalid BLEND EQUATION mode : %s", eq);
 		}
 	}
+	else if CASE(BLEND_ENABLE) {
+		const char *be = luaL_checkstring(L, -1);
+		int i;
+		for (i=0;be[i];i++) {
+			switch(be[i]) {
+			case 'i':
+				*state |= BGFX_STATE_BLEND_INDEPENDENT;
+				break;
+			case 'a':
+				*state |= BGFX_STATE_BLEND_ALPHA_TO_COVERAGE;
+				break;
+			default:
+				luaL_error(L, "Invalid BLEND ENABLE mode %s", be);
+			}
+		}
+	}
 	else if CASE(ALPHA_REF) {
 		int ref = luaL_checkinteger(L, -1);
 		*state &= ~BGFX_STATE_ALPHA_REF_MASK;
@@ -928,21 +1154,31 @@ combine_state(lua_State *L, uint64_t *state) {
 			*state |= BGFX_STATE_MSAA; 
 		else 
 			*state &= ~BGFX_STATE_MSAA;
-	} else if CASE(ALPHA_WRITE) {
-		if (lua_toboolean(L, -1))
-			*state |= BGFX_STATE_ALPHA_WRITE; 
-		else 
-			*state &= ~BGFX_STATE_ALPHA_WRITE;
-	} else if CASE(DEPTH_WRITE) {
-		if (lua_toboolean(L, -1))
-			*state |= BGFX_STATE_DEPTH_WRITE; 
-		else 
-			*state &= ~BGFX_STATE_DEPTH_WRITE;
-	} else if CASE(RGB_WRITE) {
-		if (lua_toboolean(L, -1))
-			*state |= BGFX_STATE_RGB_WRITE; 
-		else 
-			*state &= ~BGFX_STATE_RGB_WRITE;
+	} else if CASE(WRITE_MASK) {
+		*state &= ~BGFX_STATE_WRITE_MASK;
+		const char * mask = luaL_checkstring(L, -1);
+		int i;
+		for (i=0;mask[i];i++) {
+			switch (mask[i]) {
+			case 'R':
+				*state |= BGFX_STATE_WRITE_R;
+				break;
+			case 'G':
+				*state |= BGFX_STATE_WRITE_G;
+				break;
+			case 'B':
+				*state |= BGFX_STATE_WRITE_B;
+				break;
+			case 'A':
+				*state |= BGFX_STATE_WRITE_A;
+				break;
+			case 'Z':
+				*state |= BGFX_STATE_WRITE_Z;
+				break;
+			default:
+				return luaL_error(L, "Invalid WRITE_MASK %s", mask);
+			}
+		}
 	} else if CASE(DEPTH_TEST) {
 		*state &= ~BGFX_STATE_DEPTH_TEST_MASK;
 		const char * what = luaL_checkstring(L, -1);
@@ -977,51 +1213,14 @@ byte2hex(uint8_t c, uint8_t *t) {
 	t[1] = hex[c&0xf];
 }
 
-static int inline
-hex2n(lua_State *L, char c) {
-	if (c>='0' && c<='9')
-		return c-'0';
-	else if (c>='A' && c<='F')
-		return c-'A' + 10;
-	else if (c>='a' && c<='f')
-		return c-'a' + 10;
-	return luaL_error(L, "Invalid state %c", c);
-}
-
-static inline void
-get_state(lua_State *L, int idx, uint64_t *pstate, uint32_t *prgba) {
-	size_t sz;
-	const uint8_t * data = (const uint8_t *)luaL_checklstring(L, idx, &sz);
-	if (sz != 16 && sz != 24) {
-		luaL_error(L, "Invalid state length %d", sz);
-	}
-	uint64_t state = 0;
-	uint32_t rgba = 0;
-	int i;
-	for (i=0;i<15;i++) {
-		state |= hex2n(L,data[i]);
-		state <<= 4;
-	}
-	state |= hex2n(L,data[15]);
-	if (sz == 24) {
-		for (i=0;i<7;i++) {
-			rgba |= hex2n(L,data[16+i]);
-			rgba <<= 4;
-		}
-		rgba |= hex2n(L,data[23]);
-	}
-	*pstate = state;
-	*prgba = rgba;
-}
-
 static int
 lmakeState(lua_State *L) {
 	luaL_checktype(L, 1, LUA_TTABLE);
-/*#define BGFX_STATE_DEFAULT (0            \
-			| BGFX_STATE_RGB_WRITE       \
-			| BGFX_STATE_ALPHA_WRITE     \
+/*#define BGFX_STATE_DEFAULT (0          \
+			| BGFX_STATE_WRITE_RGB       \
+			| BGFX_STATE_WRITE_A         \
 			| BGFX_STATE_DEPTH_TEST_LESS \
-			| BGFX_STATE_DEPTH_WRITE     \
+			| BGFX_STATE_WRITE_Z         \
 			| BGFX_STATE_CULL_CW         \
 			| BGFX_STATE_MSAA            \
 			)
@@ -1042,7 +1241,30 @@ lmakeState(lua_State *L) {
 	while (lua_next(L, 1) != 0) {
 		if (combine_state(L, &state)) {
 			blend_factor = 1;
-			rgba = lua_tointeger(L, -1);
+			if (lua_type(L, -1) == LUA_TNUMBER) {
+				rgba = lua_tointeger(L, -1);
+			} else {
+				size_t sz;
+				const char *func = luaL_checklstring(L, -1, &sz);
+				if (sz != 3) {
+					luaL_error(L, "Invalid BLEND FUNC RT : %s", func);
+				}
+				uint64_t c1 = get_blend_func(L, func[1]);
+				uint64_t c2 = get_blend_func(L, func[2]);
+				switch (func[0]) {
+				case '1':
+					rgba = BGFX_STATE_BLEND_FUNC_RT_1(c1,c2);
+					break;
+				case '2':
+					rgba = BGFX_STATE_BLEND_FUNC_RT_2(c1,c2);
+					break;
+				case '3':
+					rgba = BGFX_STATE_BLEND_FUNC_RT_3(c1,c2);
+					break;
+				default:
+					luaL_error(L, "Invalid BLEND FUNC RT : %s", func);
+				}
+			}
 		}
 		lua_pop(L, 1);
 	}
@@ -1075,31 +1297,141 @@ lsetState(lua_State *L) {
 	return 0;
 }
 
+struct AttribNamePairs {
+	const char* name;
+	bgfx_attrib_t attrib;
+};
+
+static struct AttribNamePairs attrib_name_pairs[BGFX_ATTRIB_COUNT] = {
+		"POSITION", BGFX_ATTRIB_POSITION,
+		"NORMAL", BGFX_ATTRIB_NORMAL,
+		"TANGENT", BGFX_ATTRIB_TANGENT,
+		"BITANGENT", BGFX_ATTRIB_BITANGENT,
+		"COLOR0", BGFX_ATTRIB_COLOR0,
+		"COLOR1", BGFX_ATTRIB_COLOR1,
+		"COLOR2", BGFX_ATTRIB_COLOR2,
+		"COLOR3", BGFX_ATTRIB_COLOR3,
+		"INDICES", BGFX_ATTRIB_INDICES,
+		"WEIGHT", BGFX_ATTRIB_WEIGHT,
+		"TEXCOORD0", BGFX_ATTRIB_TEXCOORD0,
+		"TEXCOORD1", BGFX_ATTRIB_TEXCOORD1,
+		"TEXCOORD2", BGFX_ATTRIB_TEXCOORD2,
+		"TEXCOORD3", BGFX_ATTRIB_TEXCOORD3,
+		"TEXCOORD4", BGFX_ATTRIB_TEXCOORD4,
+		"TEXCOORD5", BGFX_ATTRIB_TEXCOORD5,
+		"TEXCOORD6", BGFX_ATTRIB_TEXCOORD6,
+		"TEXCOORD7", BGFX_ATTRIB_TEXCOORD7,		
+};
+
+struct AttribTypeNamePairs{
+	const char* name;
+	bgfx_attrib_type_t type;
+};
+
+static struct AttribTypeNamePairs attrib_type_name_pairs[BGFX_ATTRIB_TYPE_COUNT] = {
+	"UINT8", BGFX_ATTRIB_TYPE_UINT8,
+	"UINT10", BGFX_ATTRIB_TYPE_UINT10,
+	"INT16", BGFX_ATTRIB_TYPE_INT16,
+	"HALF", BGFX_ATTRIB_TYPE_HALF,
+	"FLOAT", BGFX_ATTRIB_TYPE_FLOAT,
+};
+
+#define ARRAY_COUNT(_ARRAY) sizeof(_ARRAY) / sizeof(_ARRAY[0])
+
+
+static int
+lexportVertexDecl(lua_State *L) {
+	bgfx_vertex_decl_t *decl = (bgfx_vertex_decl_t *)lua_touserdata(L, 1);
+
+	if (decl == NULL)
+		luaL_error(L, "Invalid decl data!");
+
+	lua_newtable(L);
+	int num_attrib = 1;
+	for (int attrib = BGFX_ATTRIB_POSITION; attrib < BGFX_ATTRIB_COUNT; ++attrib) {
+		if (bgfx_vertex_decl_has(decl, (bgfx_attrib_t)attrib)) {
+			lua_newtable(L);
+
+			uint8_t num;
+			bool nomalized, as_int;
+			bgfx_attrib_type_t attrib_type;
+			bgfx_vertex_decl_decode(decl, (bgfx_attrib_t)attrib, &num, &attrib_type, &nomalized, &as_int);
+			assert(attrib_type < BGFX_ATTRIB_TYPE_COUNT);
+
+			lua_pushstring(L, attrib_name_pairs[attrib].name);
+			lua_seti(L, -2, 1);
+
+			lua_pushnumber(L, num);
+			lua_seti(L, -2, 2);
+
+			lua_pushstring(L, attrib_type_name_pairs[attrib_type].name);
+			lua_seti(L, -2, 3);
+
+			lua_pushboolean(L, nomalized ? 1 : 0);
+			lua_seti(L, -2, 4);
+
+			lua_pushboolean(L, as_int ? 1 : 0);
+			lua_seti(L, -2, 5);
+
+			lua_seti(L, -2, num_attrib++);	// push this table
+		}
+	}
+
+	luaL_checktype(L, -1, LUA_TTABLE);
+
+	return 1;
+}
+
+static inline bgfx_attrib_t find_attrib(const char* what) {
+	for (int ii = 0; ii < ARRAY_COUNT(attrib_name_pairs); ++ii) {
+		if (strcmp(what, attrib_name_pairs[ii].name) == 0)
+			return attrib_name_pairs[ii].attrib;
+	}
+
+	return BGFX_ATTRIB_COUNT;
+}
+
+static inline bgfx_attrib_type_t find_attrib_type(const char* what) {
+	for (int ii = 0; ii < ARRAY_COUNT(attrib_type_name_pairs); ++ii) {
+		if (strcmp(what, attrib_type_name_pairs[ii].name) == 0)
+			return attrib_type_name_pairs[ii].type;
+	}
+
+	return BGFX_ATTRIB_TYPE_COUNT;
+}
+
 static void
 vertex_decl_add(lua_State *L, bgfx_vertex_decl_t *vd) {
 	if (lua_geti(L, -1, 1) != LUA_TSTRING) {
 		luaL_error(L, "Invalid attrib enum");
 	}
-	bgfx_attrib_t attrib;
+	
 	const char * what = lua_tostring(L, -1);
-	if CASE(POSITION) attrib = BGFX_ATTRIB_POSITION;
-	else if CASE(NORMAL) attrib = BGFX_ATTRIB_NORMAL;
-	else if CASE(TANGENT) attrib = BGFX_ATTRIB_TANGENT;
-	else if CASE(BITANGENT) attrib = BGFX_ATTRIB_BITANGENT;
-	else if CASE(COLOR0) attrib = BGFX_ATTRIB_COLOR0;
-	else if CASE(COLOR1) attrib = BGFX_ATTRIB_COLOR1;
-	else if CASE(COLOR2) attrib = BGFX_ATTRIB_COLOR2;
-	else if CASE(COLOR3) attrib = BGFX_ATTRIB_COLOR3;
-	else if CASE(INDICES) attrib = BGFX_ATTRIB_INDICES;
-	else if CASE(WEIGHT) attrib = BGFX_ATTRIB_WEIGHT;
-	else if CASE(TEXCOORD0) attrib = BGFX_ATTRIB_TEXCOORD0;
-	else if CASE(TEXCOORD1) attrib = BGFX_ATTRIB_TEXCOORD1;
-	else if CASE(TEXCOORD2) attrib = BGFX_ATTRIB_TEXCOORD2;
-	else if CASE(TEXCOORD4) attrib = BGFX_ATTRIB_TEXCOORD4;
-	else if CASE(TEXCOORD5) attrib = BGFX_ATTRIB_TEXCOORD5;
-	else if CASE(TEXCOORD6) attrib = BGFX_ATTRIB_TEXCOORD6;
-	else if CASE(TEXCOORD7) attrib = BGFX_ATTRIB_TEXCOORD7;
-	else { luaL_error(L, "Invalid arrtib enum : %s", what); return; }
+	const bgfx_attrib_t attrib = find_attrib(what);
+	if (attrib == BGFX_ATTRIB_COUNT) {
+		luaL_error(L, "Invalid arrtib enum : %s", what); return;
+	}
+
+	
+	//if CASE(POSITION) attrib = BGFX_ATTRIB_POSITION;
+	//else if CASE(NORMAL) attrib = BGFX_ATTRIB_NORMAL;
+	//else if CASE(TANGENT) attrib = BGFX_ATTRIB_TANGENT;
+	//else if CASE(BITANGENT) attrib = BGFX_ATTRIB_BITANGENT;
+	//else if CASE(COLOR0) attrib = BGFX_ATTRIB_COLOR0;
+	//else if CASE(COLOR1) attrib = BGFX_ATTRIB_COLOR1;
+	//else if CASE(COLOR2) attrib = BGFX_ATTRIB_COLOR2;
+	//else if CASE(COLOR3) attrib = BGFX_ATTRIB_COLOR3;
+	//else if CASE(INDICES) attrib = BGFX_ATTRIB_INDICES;
+	//else if CASE(WEIGHT) attrib = BGFX_ATTRIB_WEIGHT;
+	//else if CASE(TEXCOORD0) attrib = BGFX_ATTRIB_TEXCOORD0;
+	//else if CASE(TEXCOORD1) attrib = BGFX_ATTRIB_TEXCOORD1;
+	//else if CASE(TEXCOORD2) attrib = BGFX_ATTRIB_TEXCOORD2;
+	//else if CASE(TEXCOORD3) attrib = BGFX_ATTRIB_TEXCOORD3;
+	//else if CASE(TEXCOORD4) attrib = BGFX_ATTRIB_TEXCOORD4;
+	//else if CASE(TEXCOORD5) attrib = BGFX_ATTRIB_TEXCOORD5;
+	//else if CASE(TEXCOORD6) attrib = BGFX_ATTRIB_TEXCOORD6;
+	//else if CASE(TEXCOORD7) attrib = BGFX_ATTRIB_TEXCOORD7;
+	//else { luaL_error(L, "Invalid arrtib enum : %s", what); return; }
 	lua_pop(L, 1);
 
 	lua_geti(L, -1, 2);
@@ -1110,16 +1442,23 @@ vertex_decl_add(lua_State *L, bgfx_vertex_decl_t *vd) {
 	lua_pop(L, 1);
 
 	if (lua_geti(L, -1, 3) != LUA_TSTRING) {
-		luaL_error(L, "Invalid attrib type enum");
+		luaL_error(L, "Invalid attrib type enum");	
 	}
-	bgfx_attrib_type_t attrib_type;
+
 	what = lua_tostring(L, -1);
-	if CASE(FLOAT) attrib_type = BGFX_ATTRIB_TYPE_FLOAT;
-	else if CASE(UINT8) attrib_type = BGFX_ATTRIB_TYPE_UINT8;
-	else if CASE(INT16) attrib_type = BGFX_ATTRIB_TYPE_INT16;
-	else if CASE(UINT10) attrib_type = BGFX_ATTRIB_TYPE_UINT10;
-	else if CASE(HALF) attrib_type = BGFX_ATTRIB_TYPE_HALF;
-	else { luaL_error(L, "Invalid arrtib type enum : %s", what); return; }
+	
+	bgfx_attrib_type_t attrib_type = find_attrib_type(what);
+	if (attrib_type == BGFX_ATTRIB_TYPE_COUNT) {
+		luaL_error(L, "Invalid arrtib type enum : %s", what); return;
+	}
+	
+	//if CASE(FLOAT) attrib_type = BGFX_ATTRIB_TYPE_FLOAT;
+	//else if CASE(UINT8) attrib_type = BGFX_ATTRIB_TYPE_UINT8;
+	//else if CASE(INT16) attrib_type = BGFX_ATTRIB_TYPE_INT16;
+	//else if CASE(UINT10) attrib_type = BGFX_ATTRIB_TYPE_UINT10;
+	//else if CASE(HALF) attrib_type = BGFX_ATTRIB_TYPE_HALF;
+	//else { luaL_error(L, "Invalid arrtib type enum : %s", what); return; }
+
 	lua_pop(L, 1);
 
 	lua_geti(L, -1, 4);
@@ -1294,7 +1633,52 @@ lnewVertexDecl(lua_State *L) {
 }
 
 static const bgfx_memory_t *
-create_mem_from_table(lua_State *L, int idx, int n) {
+convert_by_decl(const void * data, size_t sz, bgfx_vertex_decl_t *src_vd, bgfx_vertex_decl_t *desc_vd) {
+	int n = sz / src_vd->stride;
+	const bgfx_memory_t *mem = bgfx_alloc(n * desc_vd->stride);
+	bgfx_vertex_convert(desc_vd, mem->data, src_vd, data, n);
+	return mem;
+}
+
+struct BufferDataStream {
+	const uint8_t *data;
+	uint32_t size;
+};
+
+static void 
+extract_buffer_stream(lua_State* L, int idx, int n, struct BufferDataStream *stream) {
+	luaL_checktype(L, idx, LUA_TTABLE);
+	int datatype = lua_geti(L, idx, n);
+	assert(datatype == LUA_TSTRING);
+
+	size_t sz = 0;
+	const char* data = lua_tolstring(L, -1, &sz);
+	lua_pop(L, 1);
+	int start = 1;
+	if (lua_geti(L, idx, n + 1) == LUA_TNUMBER) {
+		start = lua_tointeger(L, -1);
+		lua_pop(L, 1);
+	}
+	if (start < 0)
+		start = sz + start + 1;
+
+	stream->data = data + start - 1;
+
+	int end = -1;
+	if (lua_geti(L, idx, n + 2) == LUA_TNUMBER) {
+		end = lua_tointeger(L, -1);
+		lua_pop(L, 1);
+	}
+	if (end < 0)
+		end = sz + end + 1;
+	if (end < start)
+		luaL_error(L, "extract stream data : empty data");
+
+	stream->size = end - start + 1;
+}
+
+static const bgfx_memory_t *
+create_mem_from_table(lua_State *L, int idx, int n, bgfx_vertex_decl_t *src_vd, bgfx_vertex_decl_t *desc_vd) {
 	// binary data
 	int t = lua_geti(L, idx, n);
 	if (t == LUA_TLIGHTUSERDATA || t == LUA_TUSERDATA) {
@@ -1309,36 +1693,29 @@ create_mem_from_table(lua_State *L, int idx, int n) {
 			sz = lua_rawlen(L, -2);
 		}
 		lua_pop(L, 2);
-		const bgfx_memory_t *mem = bgfx_make_ref(data, sz);
-		return mem;
+		if (src_vd) {
+			return convert_by_decl(data, sz, src_vd, desc_vd);
+		} else {
+			const bgfx_memory_t *mem = bgfx_make_ref(data, sz);
+			return mem;
+		}
 	}
 
 	if (t != LUA_TSTRING) {
 		luaL_error(L, "Missing data string");
 	}
-	size_t sz = 0;
-	const char * data = lua_tolstring(L, -1, &sz);
+	
 	lua_pop(L, 1);
-	int start = 1;
-	if (lua_geti(L, idx, n+1) == LUA_TNUMBER) {
-		start = lua_tointeger(L, -1);
-		lua_pop(L, 1);
+	struct BufferDataStream stream;
+	extract_buffer_stream(L, idx, n, &stream);
+
+	if (src_vd) {
+		return convert_by_decl(stream.data, stream.size, src_vd, desc_vd);
+	} else {
+		const bgfx_memory_t *mem = bgfx_alloc(stream.size);
+		memcpy(mem->data, stream.data, stream.size);
+		return mem;
 	}
-	if (start < 0)
-		start = sz + start + 1;
-	int end = -1;
-	if (lua_geti(L, idx, n+2) == LUA_TNUMBER) {
-		end = lua_tointeger(L, -1);
-		lua_pop(L, 1);
-	}
-	if (end < 0)
-		end = sz + end + 1;
-	if (end < start)
-		luaL_error(L, "empty data");
-	int s = end - start + 1;
-	const bgfx_memory_t *mem = bgfx_alloc(s);
-	memcpy(mem->data, data + start - 1, s);
-	return mem;
 }
 
 static int
@@ -1372,16 +1749,26 @@ get_stride(lua_State *L, const char *format) {
 	b : uint8
  */
 static const bgfx_memory_t *
-create_from_table_decl(lua_State *L, int idx) {
+create_from_table_decl(lua_State *L, int idx, bgfx_vertex_decl_t *vd) {
 	luaL_checktype(L, idx, LUA_TTABLE);
-	if (lua_geti(L, idx, 1) != LUA_TSTRING) {
+	const int elemtype = lua_geti(L, idx, 1);
+	if (elemtype == LUA_TUSERDATA) {
+		// it's vd
+		bgfx_vertex_decl_t *src_vd = lua_touserdata(L, -1);
+		if (vd == NULL || memcmp(src_vd, vd, sizeof(*vd)) == 0) {
+			return create_mem_from_table(L, idx, 2, NULL, NULL);
+		} else {
+			return create_mem_from_table(L, idx, 2, src_vd, vd);
+		}
+	}
+	if (elemtype != LUA_TSTRING) {
 		luaL_error(L, "Missing layout");
 	}
 	size_t sz;
 	const char * layout = lua_tolstring(L, -1, &sz);
 	lua_pop(L, 1);
 	if (layout[0] == '!') {
-		return create_mem_from_table(L, idx, 2);
+		return create_mem_from_table(L, idx, 2, NULL, NULL);
 	}
 	int n = lua_rawlen(L, idx) - 1;
 	int stride = get_stride(L, layout);
@@ -1434,7 +1821,7 @@ create_from_table_int16(lua_State *L, int idx) {
 	luaL_checktype(L, idx, LUA_TTABLE);
 	if (lua_geti(L, idx, 1) != LUA_TNUMBER) {
 		lua_pop(L, 1);
-		return create_mem_from_table(L, idx, 1);
+		return create_mem_from_table(L, idx, 1, NULL, NULL);
 	}
 	int n = lua_rawlen(L, idx);
 	const bgfx_memory_t *mem = bgfx_alloc(n * sizeof(uint16_t));
@@ -1453,7 +1840,7 @@ create_from_table_int32(lua_State *L, int idx) {
 	luaL_checktype(L, idx, LUA_TTABLE);
 	if (lua_geti(L, idx, 1) != LUA_TNUMBER) {
 		lua_pop(L, 1);
-		return create_mem_from_table(L, idx, 1);
+		return create_mem_from_table(L, idx, 1, NULL, NULL);
 	}
 	int n = lua_rawlen(L, idx);
 	const bgfx_memory_t *mem = bgfx_alloc(n * sizeof(uint32_t));
@@ -1467,29 +1854,51 @@ create_from_table_int32(lua_State *L, int idx) {
 	return mem;
 }
 
-#include "math3d.h"
-#define DOT(a,b) vector3_dot((const struct vector3 *)a, (const struct vector3 *)b)
-#define CROSS(r,a,b) vector3_cross((struct vector3 *)r, (const struct vector3 *)a, (const struct vector3 *)b)
-#define NORMALIZE(a) vector3_normalize((struct vector3 *)a)
+#include <math.h>
+
+static inline float
+DOT(const float a[3], const float b[3]) {
+	return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static inline float *
+CROSS(float v[3], const float a[3], const float b[3]) {
+	v[0] = a[1] * b[2] - a[2] * b[1];
+	v[1] = a[2] * b[0] - a[0] * b[2];
+	v[2] = a[0] * b[1] - a[1] * b[0];
+
+	return v;
+}
+
+static inline float *
+NORMALIZE(float v[3]) {
+	float invLen = 1.0f / sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+	v[0] *= invLen;
+	v[1] *= invLen;
+	v[2] *= invLen;
+
+	return v;
+}
 
 static void
-calc_targent_vb(lua_State *L, const bgfx_memory_t *mem, bgfx_vertex_decl_t *vd, int index) {
+calc_tangent_vb(lua_State *L, const bgfx_memory_t *mem, bgfx_vertex_decl_t *vd, int index) {
 	void *vertices = mem->data;
-	int numVertices = mem->size / vd->stride;
+	uint32_t numVertices = mem->size / vd->stride;
 	const uint16_t *indices;
 	uint32_t numIndices;
 	float *tangents;
 	if (lua_geti(L, index, 1) == LUA_TSTRING) {
-		size_t sz;
-		indices = (const uint16_t *)lua_tolstring(L, -1, &sz);
-		lua_pop(L, 1);
-		numIndices = sz / 2;
-		tangents = lua_newuserdata(L, 6*numVertices);
+		struct BufferDataStream stream;
+		extract_buffer_stream(L, index, 1, &stream);
+		numIndices = stream.size / sizeof(uint16_t); // assume 16 bits per index
+		assert(numIndices <= 65535);
+		indices = (const uint16_t*)stream.data;
+		tangents = lua_newuserdata(L, 6*numVertices*sizeof(float));
 	} else {
 		numIndices = lua_rawlen(L, index);
 		uint8_t * tmp = lua_newuserdata(L, 6*numVertices + numIndices * 2);
 		uint16_t * ind = (uint16_t *)(tmp + 6*numVertices);
-		int i;
+		uint32_t i;
 		for (i=0;i<numIndices;i++) {
 			if (lua_geti(L, index, i+1) != LUA_TNUMBER) {
 				luaL_error(L, "Invalid index buffer data table");
@@ -1598,10 +2007,11 @@ calc_targent_vb(lua_State *L, const bgfx_memory_t *mem, bgfx_vertex_decl_t *vd, 
  */
 static int
 lcreateVertexBuffer(lua_State *L) {
-	const bgfx_memory_t *mem = create_from_table_decl(L, 1);
 	bgfx_vertex_decl_t *vd = lua_touserdata(L, 2);
 	if (vd == NULL)
 		return luaL_error(L, "Invalid vertex decl");
+	
+	const bgfx_memory_t *mem = create_from_table_decl(L, 1, vd);
 	uint16_t flags = BGFX_BUFFER_NONE;
 	int calc_targent = 0;
 	if (lua_isstring(L, 3)) {
@@ -1624,7 +2034,7 @@ lcreateVertexBuffer(lua_State *L) {
 		}
 	}
 	if (calc_targent) {
-		calc_targent_vb(L, mem, vd, 4);	// todo
+		calc_tangent_vb(L, mem, vd, 4);	// todo
 	}
 	bgfx_vertex_buffer_handle_t handle = bgfx_create_vertex_buffer(mem, vd, flags);
 	if (invalid_handle(handle)) {
@@ -1632,17 +2042,6 @@ lcreateVertexBuffer(lua_State *L) {
 	}
 	lua_pushinteger(L, BGFX_LUAHANDLE(VERTEX_BUFFER, handle));
 	return 1;
-}
-
-static int
-lupdateDynamicVertexBuffer(lua_State *L) {
-	int hid = BGFX_LUAHANDLE_ID(DYNAMIC_VERTEX_BUFFER, luaL_checkinteger(L, 1));
-	uint32_t start = luaL_checkinteger(L, 2);
-	const bgfx_memory_t *mem = create_from_table_decl(L, 3);
-	bgfx_dynamic_vertex_buffer_handle_t handle = { hid };
-	bgfx_update_dynamic_vertex_buffer(handle, start, mem);
-
-	return 0;
 }
 
 static int
@@ -1676,7 +2075,7 @@ lcreateDynamicVertexBuffer(lua_State *L) {
 		uint32_t num = luaL_checkinteger(L, 1);
 		handle = bgfx_create_dynamic_vertex_buffer(num, vd, flags);
 	} else {
-		const bgfx_memory_t *mem = create_from_table_decl(L, 1);
+		const bgfx_memory_t *mem = create_from_table_decl(L, 1, vd);
 		handle = bgfx_create_dynamic_vertex_buffer_mem(mem, vd, flags);
 	}
 
@@ -1738,12 +2137,18 @@ lcreateIndexBuffer(lua_State *L) {
 }
 
 static int
-lupdateDynamicIndexBuffer(lua_State *L) {
+lupdate(lua_State *L) {
 	int id = luaL_checkinteger(L, 1);
 	int idtype = id >> 16;
 	int idx = id & 0xffff;
-	bgfx_dynamic_index_buffer_handle_t handle = { idx };
 	uint32_t start = luaL_checkinteger(L, 2);
+	if (idtype == BGFX_HANDLE_DYNAMIC_VERTEX_BUFFER) {
+		const bgfx_memory_t *mem = create_from_table_decl(L, 3, NULL);
+		bgfx_dynamic_vertex_buffer_handle_t handle = { idx };
+		bgfx_update_dynamic_vertex_buffer(handle, start, mem);
+		return 0;
+	}
+	bgfx_dynamic_index_buffer_handle_t handle = { idx };
 	const bgfx_memory_t *mem;
 	if (idtype == BGFX_HANDLE_DYNAMIC_INDEX_BUFFER) {
 		mem = create_from_table_int16(L, 3);
@@ -1824,7 +2229,7 @@ lcreateIndexBufferCompress(lua_State *L) {
 
 static int
 lsetViewTransform(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	void *view = lua_touserdata(L, 2);	// can be NULL
 	if (view == NULL) {
 		luaL_checktype(L, 2, LUA_TNIL);
@@ -1836,11 +2241,11 @@ lsetViewTransform(lua_State *L) {
 	if (lua_isboolean(L, 4)) {
 		int stero = lua_toboolean(L, 4);
 		void *projR = lua_touserdata(L, 5);
-		bgfx_set_view_transform_stereo(id, view, projL, 
+		bgfx_set_view_transform_stereo(viewid, view, projL,
 			stero ? BGFX_VIEW_STEREO : BGFX_VIEW_NONE, 
 			projR);
 	} else {
-		bgfx_set_view_transform(id, view, projL);
+		bgfx_set_view_transform(viewid, view, projL);
 	}
 	return 0;
 }
@@ -1924,8 +2329,8 @@ lsetTransform(lua_State *L) {
 static int
 ldbgTextClear(lua_State *L) {
 	int attrib = luaL_optinteger(L, 1, 0);
-	int small = lua_toboolean(L, 2);
-	bgfx_dbg_text_clear(attrib, small);
+	int s = lua_toboolean(L, 2);
+	bgfx_dbg_text_clear(attrib, s);
 	return 0;
 }
 
@@ -2143,11 +2548,11 @@ lsetIDB(lua_State *L) {
 	uint32_t num = UINT32_MAX;
 	if (lua_isnumber(L, 2)) {
 		num = lua_tointeger(L, 2);
-		if (num >= v->num) {
+		if (num >= (uint32_t)v->num) {
 			return luaL_error(L, "Invalid instance data buffer num %d/%d",num, v->num);
 		}
 	}
-	bgfx_set_instance_data_buffer(&v->idb, num);
+	bgfx_set_instance_data_buffer(&v->idb, 0, num);
 	v->num = 0;
 	return 0;
 }
@@ -2309,61 +2714,83 @@ lgetUniformInfo(lua_State *L) {
 }
 
 static int
+uniform_size(lua_State *L, bgfx_uniform_handle_t uh) {
+	int sz;
+	bgfx_uniform_info_t uinfo;
+	bgfx_get_uniform_info(uh, &uinfo);
+
+	switch (uinfo.type) {
+//	case BGFX_UNIFORM_TYPE_INT1: sz = 4; break;	// 1 int32 never be INT1
+	case BGFX_UNIFORM_TYPE_VEC4: sz = 4; break;	// 4 float
+	case BGFX_UNIFORM_TYPE_MAT3: sz = 3*4; break;	// 3*4 float
+	case BGFX_UNIFORM_TYPE_MAT4: sz = 4*4; break;	// 4*4 float
+	default:
+		return luaL_error(L, "Invalid uniform type %d", uinfo.type);
+	}
+	return sz;
+}
+
+static int
 lsetUniform(lua_State *L) {
 	int uniformid = BGFX_LUAHANDLE_ID(UNIFORM, luaL_checkinteger(L, 1));
 	bgfx_uniform_handle_t uh = { uniformid };
-	int t = lua_type(L, 2);
-	if (t == LUA_TTABLE) {
-		// multi set
-		int n = lua_rawlen(L, 2);
-		bgfx_uniform_info_t info;
-		bgfx_get_uniform_info(uh, &info);
-		if (info.num < n) {
-			return luaL_error(L, "Too many uniforms %d/%d", n, (int)info.num);
-		}
-		int sz;
-		switch (info.type) {
-		case BGFX_UNIFORM_TYPE_INT1: sz = 4; break;	// 1 int32
-		case BGFX_UNIFORM_TYPE_VEC4: sz = 4*4; break;	// 4 float
-		case BGFX_UNIFORM_TYPE_MAT3: sz = 3*4*4; break;	// 3*4 float
-		case BGFX_UNIFORM_TYPE_MAT4: sz = 4*4*4; break;	// 4*4 float
-		default:
-			return luaL_error(L, "Invalid uniform type %d", info.type);
-		}
-		ARRAY(uint8_t, buffer, sz * n);
-		if (info.type == BGFX_UNIFORM_TYPE_INT1) {
-			int i;
-			int32_t * data = (int32_t *)buffer;
-			for (i=0;i<n;i++) {
-				if (lua_geti(L, 2, i+1) != LUA_TNUMBER) {
-					return luaL_error(L, "Uniform is int1, need number");
+	int number = lua_gettop(L) - 1;
+	int t = lua_type(L, 2);	// the first value type
+	switch(t) {
+	case LUA_TTABLE: {
+		// vector or matrix
+		int sz = uniform_size(L, uh);
+		float buffer[V(sz * number)];
+		int i,j;
+		for (i=0;i<number;i++) {
+			luaL_checktype(L, 2+i, LUA_TTABLE);
+			for (j=0;j<sz;j++) {
+				if (lua_geti(L, 2+i, j+1) != LUA_TNUMBER) {
+					return luaL_error(L, "[%d,%d] should be number", i+2,j+1);
 				}
-				data[i] = lua_tointeger(L, -1);
+				buffer[i*sz+j] = lua_tonumber(L, -1);
 				lua_pop(L, 1);
 			}
-		} else {
-			int i;
-			for (i=0;i<n;i++) {
-				lua_geti(L, 2, i+1);
-				void * ud = lua_touserdata(L, -1);
-				if (ud == NULL) {
-					return luaL_error(L, "Uniform need userdata");
-				}
-				lua_pop(L, 1);
-				memcpy(buffer + i * sz, ud, sz);
-			}
 		}
-		bgfx_set_uniform(uh, buffer, n);
-	} else if (t == LUA_TNUMBER) {
-		int32_t v = lua_tointeger(L, 2);
-		bgfx_set_uniform(uh, &v, 1);
-	} else {
-		void *data = lua_touserdata(L, 2);
-		if (data == NULL)
-			return luaL_error(L, "Uniform can't be NULL");
-		bgfx_set_uniform(uh, data, 1);
+		bgfx_set_uniform(uh, buffer, number);
+		break;
 	}
-
+	case LUA_TNUMBER: {
+		// int1
+		uint32_t ints[V(number)];
+		int i;
+		for (i=0;i<number;i++) {
+			ints[i] = luaL_checkinteger(L, i+2);
+		}
+		bgfx_set_uniform(uh, ints, number);
+		break;
+	}
+	case LUA_TUSERDATA:
+	case LUA_TLIGHTUSERDATA:
+		// vectir or matrix
+		if (number == 1) {
+			// only one
+			void *data = lua_touserdata(L, 2);
+			if (data == NULL)
+				return luaL_error(L, "Uniform can't be NULL");
+			bgfx_set_uniform(uh, data, 1);
+		} else {
+			int sz = uniform_size(L, uh);
+			float buffer[V(sz * number)];
+			int i;
+			for (i=0;i<number;i++) {
+				void * ud = lua_touserdata(L, 2+i);
+				if (ud == NULL) {
+					return luaL_error(L, "Uniform need userdata at index %d", i+2);
+				}
+				memcpy(buffer + i * sz, ud, sz*sizeof(float));
+			}
+			bgfx_set_uniform(uh, buffer, number);
+		}
+		break;
+	default:
+		return luaL_error(L, "Invalid value type : %s", lua_typename(L, t));
+	}
 	return 0;
 }
 
@@ -2424,6 +2851,7 @@ get_texture_flags(lua_State *L, const char *format) {
 			switch(format[i+1]) {
 			case 'r' : flags |= BGFX_TEXTURE_READ_BACK; break;
 			case 'w' : flags |= BGFX_TEXTURE_BLIT_DST; break;
+			case 'c' : flags |= BGFX_TEXTURE_COMPUTE_WRITE; break;
 			default:
 				luaL_error(L, "Invalid BLIT %c", format[i+1]);
 			}
@@ -2487,6 +2915,60 @@ parse_texture_info(lua_State *L, int idx, bgfx_texture_info_t *info) {
 	lua_setfield(L, idx, "cubeMap");
 }
 
+static int
+memory_tostring(lua_State *L) {
+	void * data = lua_touserdata(L, 1);
+	size_t sz = lua_rawlen(L, 1);
+	lua_pushlstring(L, data, sz);
+	return 1;
+}
+
+// base 1
+static int
+memory_read(lua_State *L) {
+	int index = luaL_checkinteger(L, 2)-1;
+	uint32_t * data = (uint32_t *)lua_touserdata(L, 1);
+	size_t sz = lua_rawlen(L, 1);
+	if (index < 0 || index * sizeof(uint32_t) >=sz) {
+		return 0;
+	}
+	lua_pushinteger(L, data[index]);
+	return 1;
+}
+
+static int
+memory_write(lua_State *L) {
+	int index = luaL_checkinteger(L, 2)-1;
+	uint32_t * data = (uint32_t *)lua_touserdata(L, 1);
+	size_t sz = lua_rawlen(L, 1);
+	if (index < 0 || index * sizeof(uint32_t) >=sz) {
+		return luaL_error(L, "out of range %d/[1-%d]", index+1, sz / sizeof(uint32_t));
+	}
+	uint32_t v = luaL_checkinteger(L, 2);
+	data[index] = v;
+	return 0;
+}
+
+/*
+	integer size	(width * height * 4 for RGBA8888)
+ */
+static int
+lmemoryTexture(lua_State *L) {
+	int size = luaL_checkinteger(L, 1);
+	void * data = lua_newuserdata(L, size);
+	memset(data, 0, size);
+	if (luaL_newmetatable(L, "BGFX_MEMORY")) {
+		lua_pushcfunction(L, memory_tostring);
+		lua_setfield(L, -2, "__tostring");
+		lua_pushcfunction(L, memory_read);
+		lua_setfield(L, -2, "__index");
+		lua_pushcfunction(L, memory_write);
+		lua_setfield(L, -2, "__newindex");
+	}
+	lua_setmetatable(L, -2);
+	return 1;
+}
+
 /*
 	string imgdata
 	string flags	-- [uvw]m/c[-+*]p/a  - MIN + MAG * MIP
@@ -2531,16 +3013,17 @@ lsetName(lua_State *L) {
 	int idx = luaL_checkinteger(L, 1);
 	int type = idx >> 16;
 	int id = idx & 0xffff;
-	const char *name = lua_tostring(L, 2);
+	size_t sz;
+	const char *name = luaL_checklstring(L, 2, &sz);
 	switch(type) {
 	case BGFX_HANDLE_SHADER: {
 		bgfx_shader_handle_t handle = { id };
-		bgfx_set_shader_name(handle, name);
+		bgfx_set_shader_name(handle, name, sz);
 		break;
 	}
 	case BGFX_HANDLE_TEXTURE : {
 		bgfx_texture_handle_t handle = { id };
-		bgfx_set_texture_name(handle, name);
+		bgfx_set_texture_name(handle, name, sz);
 		break;
 	}
 	default:
@@ -2633,7 +3116,7 @@ create_fb_mrt(lua_State *L) {
 		luaL_error(L, "At lease one frame buffer");
 	}
 	int destroy = lua_toboolean(L, 2);
-	ARRAY(bgfx_texture_handle_t, handles, n);
+	bgfx_texture_handle_t handles[V(n)];
 	int i;
 	for (i=0;i<n;i++) {
 		if (lua_geti(L, 1, i+1) != LUA_TNUMBER) {
@@ -2746,11 +3229,25 @@ lcreateTexture2D(lua_State *L) {
 	if (scaled) {
 		handle = bgfx_create_texture_2d_scaled(ratio, hasMips, layers, fmt, flags);
 	} else {
-		size_t sz;
-		const char * data = lua_tolstring(L, idx, &sz);
 		const bgfx_memory_t * mem = NULL;
-		if (data) {
+		switch (lua_type(L, idx)) {
+		case LUA_TSTRING: {
+			size_t sz;
+			const char * data = lua_tolstring(L, idx, &sz);
 			mem = bgfx_copy(data, sz);
+			break;
+		}
+		case LUA_TUSERDATA: {
+			void *data = luaL_checkudata(L, idx, "BGFX_MEMORY");
+			size_t sz = lua_rawlen(L, idx);
+			mem = bgfx_make_ref(data, sz);
+			break;
+		}
+		case LUA_TNIL:
+		case LUA_TNONE:
+			break;
+		default:
+			return luaL_error(L, "Invalid texture data type %s", lua_typename(L, lua_type(L, idx)));
 		}
 		handle = bgfx_create_texture_2d(width, height, hasMips, layers, fmt, flags, mem);
 	}
@@ -2759,6 +3256,36 @@ lcreateTexture2D(lua_State *L) {
 	}
 	lua_pushinteger(L, BGFX_LUAHANDLE(TEXTURE, handle));
 	return 1;
+}
+
+/*
+	integer texture id
+	integer layer
+	integer mip
+	integer x
+	integer y
+	integer w
+	integer h
+	userdata BGFX_MEMORY
+	integer pitch = UINT16_MAX
+ */
+static int
+lupdateTexture2D(lua_State *L) {
+	uint16_t tid = BGFX_LUAHANDLE_ID(TEXTURE, luaL_checkinteger(L, 1));
+	bgfx_texture_handle_t th = { tid };
+	int layer = luaL_checkinteger(L, 2);
+	int mip = luaL_checkinteger(L, 3);
+	int x = luaL_checkinteger(L, 4);
+	int y = luaL_checkinteger(L, 5);
+	int w = luaL_checkinteger(L, 6);
+	int h = luaL_checkinteger(L, 7);
+	void *data = luaL_checkudata(L, 8, "BGFX_MEMORY");
+	size_t sz  = lua_rawlen(L, 8);
+	const bgfx_memory_t *mem = bgfx_make_ref(data, sz);
+	int pitch = luaL_optinteger(L, 9, UINT16_MAX);
+	bgfx_update_texture_2d(th, layer, mip, x, y, w, h, mem, pitch);
+
+	return 0;
 }
 
 /*
@@ -2791,13 +3318,13 @@ lsetViewOrder(lua_State *L) {
 	luaL_checktype(L, 1, LUA_TTABLE);
 	// todo: set first view not 0
 	int n = lua_rawlen(L, 1);
-	ARRAY(uint8_t, order, n);
+	bgfx_view_id_t order[V(n)];
 	int i;
 	for (i=0;i<n;i++) {
 		if (lua_geti(L, 1, i+1) != LUA_TNUMBER) {
 			return luaL_error(L, "Invalid view id");
 		}
-		order[i] = (uint8_t)lua_tointeger(L, -1);
+		order[i] = (bgfx_view_id_t)lua_tointeger(L, -1);
 		lua_pop(L, 1);
 	}
 	bgfx_set_view_order(0,n,order);
@@ -2806,24 +3333,24 @@ lsetViewOrder(lua_State *L) {
 
 static int
 lsetViewRect(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	int x = luaL_checkinteger(L, 2);
 	int y = luaL_checkinteger(L, 3);
 	int t = lua_type(L, 4);
 	switch(t) {
 	case LUA_TSTRING: {
 		bgfx_backbuffer_ratio_t ratio = get_ratio(L, 4);
-		bgfx_set_view_rect_auto(id, x, y, ratio);
+		bgfx_set_view_rect_auto(viewid, x, y, ratio);
 		break;
 	}
 	case LUA_TNONE:
 	case LUA_TNIL:
-		bgfx_set_view_rect_auto(id, x, y, BGFX_BACKBUFFER_RATIO_EQUAL);
+		bgfx_set_view_rect_auto(viewid, x, y, BGFX_BACKBUFFER_RATIO_EQUAL);
 		break;
 	case LUA_TNUMBER: {
 		int w = luaL_checkinteger(L, 4);
 		int h = luaL_checkinteger(L, 5);
-		bgfx_set_view_rect(id, x, y, w, h);
+		bgfx_set_view_rect(viewid, x, y, w, h);
 		break;
 	}
 	default:
@@ -2834,21 +3361,21 @@ lsetViewRect(lua_State *L) {
 
 static int
 lsetViewName(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	const char *name = luaL_checkstring(L, 2);
-	bgfx_set_view_name(id, name);
+	bgfx_set_view_name(viewid, name);
 	return 0;
 }
 
 static int
 lsetViewFrameBuffer(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	uint16_t hid = UINT16_MAX;
 	if (!lua_isnoneornil(L, 2)) {
 		hid = BGFX_LUAHANDLE_ID(FRAME_BUFFER, luaL_checkinteger(L, 2));
 	}
 	bgfx_frame_buffer_handle_t h = {hid};
-	bgfx_set_view_frame_buffer(id, h);
+	bgfx_set_view_frame_buffer(viewid, h);
 	return 0;
 }
 
@@ -2899,7 +3426,7 @@ lgetTexture(lua_State *L) {
  */
 static int
 lblit(lua_State *L) {
-	int id = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	uint16_t dstid = BGFX_LUAHANDLE_ID(TEXTURE, luaL_checkinteger(L, 2));
 	int top = lua_gettop(L);
 	uint16_t dstx;
@@ -2949,13 +3476,13 @@ lblit(lua_State *L) {
 	bgfx_texture_handle_t sh = { srcid };
 	bgfx_texture_handle_t dh = { dstid };
 
-	bgfx_blit(id, dh, dstmip, dstx, dsty, dstz, sh, srcmip, srcx, srcy, srcz, width, height, depth);
+	bgfx_blit(viewid, dh, dstmip, dstx, dsty, dstz, sh, srcmip, srcx, srcy, srcz, width, height, depth);
 	return 0;
 }
 
 /*
 	integer texture id
-	integer storage size
+	userdata BGFX_MEMORY
 	integer mip = 0
 
 	return string
@@ -2963,15 +3490,11 @@ lblit(lua_State *L) {
 static int
 lreadTexture(lua_State *L) {
 	uint16_t tid = BGFX_LUAHANDLE_ID(TEXTURE, luaL_checkinteger(L, 1));
-	int sz = luaL_checkinteger(L, 2);
+	void *data = luaL_checkudata(L, 2, "BGFX_MEMORY");
 	int mip = luaL_optinteger(L, 3, 0);
-	luaL_Buffer b;
-	char *tmp = luaL_buffinitsize(L, &b, sz);
-	// todo: return frame number
 	bgfx_texture_handle_t th = { tid };
-	bgfx_read_texture(th, tmp, mip);
-	luaL_addsize(&b, sz);
-	luaL_pushresult(&b);
+	int frame = bgfx_read_texture(th, data, mip);
+	lua_pushinteger(L, frame);
 	return 1;
 }
 
@@ -3168,13 +3691,8 @@ lcreateIndirectBuffer(lua_State *L) {
 	return 1;
 }
 
-static int
-lsetBuffer(lua_State *L) {
-	int stage = luaL_checkinteger(L, 1);
-	int idx = luaL_checkinteger(L, 2);
-	int type = idx >> 16;
-	int id = idx & 0xffff;
-	const char * access = luaL_checkstring(L, 3);
+static bgfx_access_t
+access_string(lua_State *L, const char * access) {
 	bgfx_access_t a;
 	if (access[0] == 'r') {
 		a = BGFX_ACCESS_READ;
@@ -3187,8 +3705,19 @@ lsetBuffer(lua_State *L) {
 		if ((a == BGFX_ACCESS_READ && access[1] == 'w') || (a == BGFX_ACCESS_WRITE && access[1] == 'r'))
 			a = BGFX_ACCESS_READWRITE;
 		else
-			return luaL_error(L, "Invalid buffer access %s", access);
+			luaL_error(L, "Invalid buffer access %s", access);
 	}
+	return a;
+}
+
+static int
+lsetBuffer(lua_State *L) {
+	int stage = luaL_checkinteger(L, 1);
+	int idx = luaL_checkinteger(L, 2);
+	int type = idx >> 16;
+	int id = idx & 0xffff;
+	const char * access = luaL_checkstring(L, 3);
+	bgfx_access_t a = access_string(L, access);
 	switch(type) {
 	case BGFX_HANDLE_VERTEX_BUFFER: {
 		bgfx_vertex_buffer_handle_t handle = { id };
@@ -3300,7 +3829,7 @@ dispatch_opt(lua_State *L, int *num, int n, int index) {
 
 static int
 ldispatch(lua_State *L) {
-	int viewid = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	int pid = BGFX_LUAHANDLE_ID(PROGRAM, luaL_checkinteger(L, 2));
 	int num[3] = {1,1,1};
 	uint8_t flags = dispatch_opt(L, num, 3, 3);
@@ -3314,7 +3843,7 @@ ldispatch(lua_State *L) {
 
 static int
 ldispatchIndirect(lua_State *L) {
-	int viewid = luaL_checkinteger(L, 1);
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
 	int pid = BGFX_LUAHANDLE_ID(PROGRAM, luaL_checkinteger(L, 2));
 	int iid = BGFX_LUAHANDLE_ID(INDIRECT_BUFFER, luaL_checkinteger(L, 3));
 	int num[2] = { 0, 1 };
@@ -3333,7 +3862,7 @@ lgetShaderUniforms(lua_State *L) {
 	bgfx_shader_handle_t shader = { sid };
 	uint16_t n = bgfx_get_shader_uniforms(shader, NULL, 0);
 	lua_createtable(L, n, 0);
-	ARRAY(bgfx_uniform_handle_t, u, n);
+	bgfx_uniform_handle_t u[V(n)];
 	bgfx_get_shader_uniforms(shader, u, n);
 	int i;
 	for (i=0;i<n;i++) {
@@ -3342,6 +3871,78 @@ lgetShaderUniforms(lua_State *L) {
 		lua_rawseti(L, -2, i+1);
 	}
 	return 1;
+}
+
+static int
+lsetViewMode(lua_State *L) {
+	bgfx_view_id_t viewid = luaL_checkinteger(L, 1);
+	if (lua_isnoneornil(L, 2)) {
+		bgfx_set_view_mode(viewid, BGFX_VIEW_MODE_DEFAULT);
+	} else {
+		const char* mode = luaL_checkstring(L, 2);
+		switch(mode[0]) {
+		case 'd': bgfx_set_view_mode(viewid, BGFX_VIEW_MODE_DEPTH_ASCENDING); break;
+		case 'D': bgfx_set_view_mode(viewid, BGFX_VIEW_MODE_DEPTH_DESCENDING); break;
+		case 's': bgfx_set_view_mode(viewid, BGFX_VIEW_MODE_SEQUENTIAL); break;
+		default:
+			return luaL_error(L, "Invalid view mode %s", mode);
+		}
+	}
+	return 0;
+}
+
+static int
+lsetImage(lua_State *L) {
+	int stage = luaL_checkinteger(L, 1);
+	int tid = BGFX_LUAHANDLE_ID(TEXTURE, luaL_checkinteger(L, 2));
+	bgfx_texture_handle_t handle = { tid };
+	int mip = luaL_checkinteger(L, 3);
+	bgfx_access_t access = access_string(L, luaL_checkstring(L, 4));
+	bgfx_texture_format_t format = 0;
+	if (lua_isnoneornil(L, 5)) {
+		format = BGFX_TEXTURE_FORMAT_COUNT;
+	} else {
+		format = texture_format_from_string(L, 5);
+	}
+	bgfx_set_image(stage, handle, mip, access, format);
+	return 0;
+}
+
+static int
+lrequestScreenshot(lua_State *L) {
+	bgfx_frame_buffer_handle_t handle = { UINT16_MAX };	// Invalid handle (main window)
+	if (lua_type(L,1) == LUA_TNUMBER) {
+		int id = BGFX_LUAHANDLE_ID(FRAME_BUFFER, luaL_checkinteger(L, 1));
+		handle.idx = id;
+	}
+	const char * file = luaL_optstring(L, 2, "");
+	bgfx_request_screen_shot(handle, file);
+	return 0;
+}
+
+static int
+lgetScreenshot(lua_State *L) {
+	int memptr = lua_toboolean(L, 1);
+	if (lua_getfield(L, LUA_REGISTRYINDEX, "bgfx_cb") != LUA_TUSERDATA) {
+		return luaL_error(L, "init first");
+	}
+	struct callback *cb = lua_touserdata(L, -1);
+	struct screenshot * s = ss_pop(&cb->ss);
+	if (s == NULL)
+		return 0;
+	lua_pushstring(L, s->name);
+	lua_pushinteger(L, s->width);
+	lua_pushinteger(L, s->height);
+	lua_pushinteger(L, s->pitch);
+	if (memptr) {
+		lua_pushlightuserdata(L, s->data);
+		lua_pushinteger(L, s->size);
+		s->data = NULL;
+	} else {
+		lua_pushlstring(L, (const char *)s->data, s->size);
+	}
+	ss_free(s);
+	return memptr ? 6 : 5;
 }
 
 LUAMOD_API int
@@ -3396,8 +3997,10 @@ luaopen_bgfx(lua_State *L) {
 		{ "get_uniform_info", lgetUniformInfo },
 		{ "set_uniform", lsetUniform },
 		{ "instance_buffer", lnewInstanceBuffer },
+		{ "memory_texture", lmemoryTexture },
 		{ "create_texture", lcreateTexture },	// create texture from data string (DDS, KTX or PVR texture data)
 		{ "create_texture2d", lcreateTexture2D },
+		{ "update_texture2d", lupdateTexture2D },
 		{ "is_texture_valid", lisTextureValid },
 		{ "set_texture", lsetTexture },
 		{ "set_name", lsetName },
@@ -3419,9 +4022,13 @@ luaopen_bgfx(lua_State *L) {
 		{ "dispatch_indirect", ldispatchIndirect },
 		{ "set_instance_data_buffer", lsetInstanceDataBuffer },
 		{ "submit_indirect", lsubmitIndirect },
-		{ "update_dynamic_vertex_buffer", lupdateDynamicVertexBuffer },
-		{ "update_dynamic_index_buffer", lupdateDynamicIndexBuffer },
+		{ "update", lupdate },
 		{ "get_shader_uniforms", lgetShaderUniforms },
+		{ "set_view_mode", lsetViewMode },
+		{ "set_image", lsetImage },
+		{ "request_screenshot", lrequestScreenshot },
+		{ "get_screenshot", lgetScreenshot },
+		{ "export_vertex_decl", lexportVertexDecl },
 		{ NULL, NULL },
 	};
 	luaL_newlib(L, l);

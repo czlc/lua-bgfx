@@ -276,7 +276,7 @@ local function mainloop()
 				)
 
 	bgfx.dbg_text_print(0, 1, 0xf, "Color can be changed with ANSI \x1b[9;me\x1b[10;ms\x1b[11;mc\x1b[12;ma\x1b[13;mp\x1b[14;me\x1b[0m code too.");
-	local stats = bgfx.get_stats("whWH",ctx.stats)
+	local stats = bgfx.get_stats("sd",ctx.stats)
 	bgfx.dbg_text_print(0, 2, 0x0f, string.format("Backbuffer %dW x %dH in pixels, debug text %dW x %dH in characters."
 				, stats.width
 				, stats.height
@@ -286,9 +286,12 @@ local function mainloop()
 	bgfx.frame()
 end
 
-local function init(canvas)
+local function init(canvas, width, height, reset)
 	ant.init {
 		nwh = iup.GetAttributeData(canvas,"HWND"),
+		width = width,
+		height = height,
+		reset = reset,
 	}
 	bgfx.set_view_clear(0, "CD", 0x303030ff, 1, 0)
 	bgfx.set_debug "T"
@@ -298,7 +301,7 @@ end
 
 function canvas:resize_cb(w,h)
 	if init then
-		init(self)
+		init(self,w,h,"v")
 		init = nil
 	end
 	bgfx.set_view_rect(0, 0, 0, w, h)
